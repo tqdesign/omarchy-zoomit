@@ -8,12 +8,14 @@
 local keys = {
   zoom = "CTRL + code:10",
   draw = "CTRL + code:11",
+  live_draw = "CTRL + SHIFT + code:11",
   break_timer = "CTRL + code:12",
   live_zoom = "CTRL + code:13",
   record = "CTRL + code:14",
   record_region = "CTRL + SHIFT + code:14",
   snip = "CTRL + code:15",
   snip_save = "CTRL + SHIFT + code:15",
+  snip_text = "CTRL + ALT + code:15",
   demotype = "CTRL + code:16",
   demotype_back = "CTRL + SHIFT + code:16",
 }
@@ -24,9 +26,12 @@ local LIVE_MAX = 16
 
 local zoomit = (os.getenv("HOME") or "") .. "/.config/omarchy/plugins/tqdesign.zoomit/bin/zoomit"
 
-local bind = (o and o.bind) or function(key, description, action, opts)
+-- The overlay inhibits compositor shortcuts while it is up, so the desktop
+-- can't change under a frozen screen. dont_inhibit lets these keys through.
+local function bind(key, description, action, opts)
   opts = opts or {}
   opts.description = description
+  opts.dont_inhibit = true
   if type(action) == "string" then
     action = hl.dsp.exec_cmd(action)
   end
@@ -38,14 +43,25 @@ hl.layer_rule({ match = { namespace = "tqdesign-zoomit" }, no_anim = true, anima
 
 bind(keys.zoom, "ZoomIt: zoom", zoomit .. " zoom")
 bind(keys.draw, "ZoomIt: draw", zoomit .. " draw")
+bind(keys.live_draw, "ZoomIt: draw on the live screen", zoomit .. " livedraw")
 bind(keys.break_timer, "ZoomIt: break timer", zoomit .. " break")
 bind(keys.record, "ZoomIt: record screen", zoomit .. " record")
 bind(keys.record_region, "ZoomIt: record region", zoomit .. " record region")
 bind(keys.snip, "ZoomIt: snip to clipboard", zoomit .. " snip")
 bind(keys.snip_save, "ZoomIt: snip to file", zoomit .. " snip save")
+bind(keys.snip_text, "ZoomIt: snip text (OCR)", zoomit .. " snip text")
 -- On release, so the typed text isn't sent with Ctrl still held.
 bind(keys.demotype, "ZoomIt: DemoType next", zoomit .. " demotype", { release = true })
 bind(keys.demotype_back, "ZoomIt: DemoType back", zoomit .. " demotype back", { release = true })
+
+-- User-driven DemoType ("demoTypeUserDriven" in config.json): bin/zoomit
+-- enters this submap, where every key types the next character of the script
+-- instead of itself. It leaves by itself at the end of the segment; Esc
+-- leaves early.
+hl.define_submap("zoomit-demotype", function()
+  hl.bind("ESCAPE", hl.dsp.exec_cmd(zoomit .. " demotype stop"), { description = "ZoomIt: stop DemoType" })
+  hl.bind("catchall", hl.dsp.exec_cmd(zoomit .. " demotype key"), { description = "ZoomIt: DemoType next character" })
+end)
 
 -- Live zoom is the compositor's own magnifier, so the desktop stays usable.
 -- Ctrl+Up/Down change the level and are bound only while it is on.

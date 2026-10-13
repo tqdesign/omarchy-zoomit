@@ -1,8 +1,10 @@
 #!/bin/bash
 # Called by Overlay.qml to finish a copy, save or snip.
-#   zoomit-export copy <image> [WxH+X+Y]
-#   zoomit-export save <image> [WxH+X+Y]
-# The optional geometry crops first (snip), in image pixels.
+#   zoomit-export copy|save|text <image> [WxH+X+Y]
+#   zoomit-export copy|save screen:<output>
+# The optional geometry crops first (snip), in image pixels. text runs OCR on
+# the result and copies what it reads. screen:<output> screenshots that
+# monitor instead of reading a file (live draw has no still of its own).
 
 set -u
 
@@ -10,15 +12,19 @@ action=${1:-}
 src=${2:-}
 crop=${3:-}
 
-[[ -f $src ]] || exit 1
-
-png() {
-  if [[ -n $crop ]]; then
-    magick "$src" -crop "$crop" +repage png:-
-  else
-    magick "$src" png:-
-  fi
-}
+if [[ $src == screen:* ]]; then
+  png() { grim -o "${src#screen:}" -; }
+elif [[ -f $src ]]; then
+  png() {
+    if [[ -n $crop ]]; then
+      magick "$src" -crop "$crop" +repage png:-
+    else
+      magick "$src" png:-
+    fi
+  }
+else
+  exit 1
+fi
 
 case "$action" in
 copy)
@@ -31,7 +37,22 @@ save)
   out="$out_dir/zoomit-$(date +%Y-%m-%d_%H-%M-%S).png"
   png >"$out" && notify-send -i "$out" "ZoomIt" "Saved ${out/#$HOME/\~}"
   ;;
+text)
+  # Same tesseract settings as omarchy-capture-text.
+  text=$(png | tesseract stdin stdout --oem 1 --psm 6 -l "${OMARCHY_OCR_LANGS:-eng}" --dpi 300 -c preserve_interword_spaces=1 2>/dev/null)
+  if [[ -n ${text//[[:space:]]/} ]]; then
+    printf "%s" "$text" | wl-copy
+    notify-send "ZoomIt" "Copied text from the selection"
+  else
+    notify-send "ZoomIt" "No text found in the selection"
+  fi
+  ;;
 *)
   exit 2
   ;;
+esac
+
+# The overlay's own stills and grabs are spent once exported.
+case "$src" in
+"${XDG_RUNTIME_DIR:-/tmp}"/zoomit/shot-*.ppm | "${XDG_RUNTIME_DIR:-/tmp}"/zoomit/grab-*.png) rm -f "$src" ;;
 esac

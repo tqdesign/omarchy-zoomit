@@ -15,34 +15,85 @@ Item {
   property var shell: null
   property var manifest: null
 
-  // Tunables.
-  readonly property real defaultZoom: 2
-  readonly property real maxZoom: 32
-  readonly property real zoomStep: 1.1
-  readonly property int zoomAnimMs: 140
-  readonly property real defaultPenWidth: 5
-  readonly property real defaultFontSize: 36
-  readonly property int defaultBreakMinutes: 10
-  readonly property color breakBackground: "#ffffff"
-  // ZoomIt puts the arrow head where the drag starts.
-  readonly property bool arrowHeadAtStart: true
-  readonly property var penColors: ({
+  // Defaults for ~/.config/zoomit/config.json; see config.example.json.
+  readonly property var defaults: ({
+    defaultZoom: 2,
+    zoomStep: 1.1,
+    zoomAnimMs: 140,
+    penWidth: 5,
+    penColor: "r",
+    fontSize: 36,
+    // ZoomIt puts the arrow head where the drag starts.
+    arrowHeadAtStart: true,
+    breakMinutes: 10,
+    breakBackground: "#ffffff",
+    breakImage: "",
+    breakAllMonitors: true
+  })
+  readonly property var defaultColors: ({
     r: "#ff0000", g: "#00ff00", b: "#0000ff",
     o: "#ff8000", y: "#ffff00", p: "#ff00ff"
   })
+  readonly property string defaultBreakSound: "/usr/share/sounds/freedesktop/stereo/complete.oga"
+  property var userSettings: ({})
+
+  function setting(key) {
+    var value = root.userSettings[key]
+    return typeof value === typeof root.defaults[key] ? value : root.defaults[key]
+  }
+
+  readonly property real maxZoom: 32
+  readonly property real defaultZoom: Math.max(1.1, Math.min(maxZoom, setting("defaultZoom")))
+  readonly property real zoomStep: Math.max(1.01, setting("zoomStep"))
+  readonly property int zoomAnimMs: Math.max(0, setting("zoomAnimMs"))
+  readonly property real defaultPenWidth: Math.max(1, Math.min(60, setting("penWidth")))
+  readonly property real defaultFontSize: Math.max(10, Math.min(300, setting("fontSize")))
+  readonly property string defaultPenKey: defaultColors[setting("penColor")] ? setting("penColor") : "r"
+  readonly property bool arrowHeadAtStart: setting("arrowHeadAtStart")
+  readonly property real defaultBreakMinutes: Math.max(1, setting("breakMinutes"))
+  readonly property color breakBackground: setting("breakBackground")
+  readonly property string breakImage: setting("breakImage")
+  readonly property bool breakAllMonitors: setting("breakAllMonitors")
+  // true plays the stock chime, a string plays that file, false is silent.
+  readonly property string breakSound: {
+    var value = root.userSettings.breakSound
+    if (value === false) return ""
+    return typeof value === "string" && value !== "" ? value : root.defaultBreakSound
+  }
+  readonly property var penColors: {
+    var merged = ({})
+    var custom = root.userSettings.colors
+    for (var key in root.defaultColors) {
+      merged[key] = custom && typeof custom[key] === "string" ? custom[key] : root.defaultColors[key]
+    }
+    return merged
+  }
+
+  onDefaultPenWidthChanged: penWidth = defaultPenWidth
+  onDefaultFontSizeChanged: fontSize = defaultFontSize
+  onDefaultPenKeyChanged: penKey = defaultPenKey
 
   readonly property string pluginId: (manifest && manifest.id) ? String(manifest.id) : "tqdesign.zoomit"
   readonly property string pluginDir: decodeURIComponent(
     Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, ""))
   readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/zoomit"
+  readonly property string configPath: Quickshell.env("HOME") + "/.config/zoomit/config.json"
 
   property bool opened: false
   property bool pending: false
+  property bool closing: false
   property var request: ({})
   // "zoom" | "draw" | "type" | "snip" | "break"
   property string mode: ""
+  // Live draw: no still, the desktop keeps running under the ink.
+  property bool live: false
+  // Live draw only: input falls through to the desktop, the ink stays up.
+  property bool passthrough: false
+  property bool exporting: false
+  property bool helpShown: false
   property var targetScreen: null
   property string shotFile: ""
+  property bool shotInUse: false
 
   // Item already has a final z, so the animated value needs its own name.
   // zoom is the target, shown what is on screen while it animates.
@@ -62,12 +113,12 @@ Item {
   readonly property real tx: -anchorX * (shown - 1)
   readonly property real ty: -anchorY * (shown - 1)
 
-  property string penKey: "r"
+  property string penKey: defaultPenKey
   property bool highlight: false
   property bool blurPen: false
   property real penWidth: defaultPenWidth
   property real fontSize: defaultFontSize
-  readonly property color penColor: penColors[penKey] || penColors.r
+  readonly property color penColor: penColors[penKey] || defaultColors.r
   // "" | "white" | "black"
   property string board: ""
 
@@ -80,7 +131,8 @@ Item {
   property int blurCount: 0
   property bool tabHeld: false
 
-  property bool snipSave: false
+  // "copy" | "save" | "text"
+  property string snipAction: "copy"
   property bool selecting: false
   property real selX1: 0
   property real selY1: 0
@@ -94,29 +146,51 @@ Item {
   onTxChanged: repaint()
   onTyChanged: repaint()
 
+  function loadSettings(text) {
+    var parsed = null
+    try { parsed = JSON.parse(text) } catch (e) { parsed = null }
+    root.userSettings = parsed && typeof parsed === "object" ? parsed : ({})
+  }
+
   function open(payloadJson) {
     var payload = ({})
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
     var want = String(payload.mode || "zoom")
-    if (["zoom", "draw", "snip", "break"].indexOf(want) === -1) want = "zoom"
+    if (["zoom", "draw", "livedraw", "snip", "break"].indexOf(want) === -1) want = "zoom"
 
-    if (root.pending) return
+    if (root.pending || root.closing) return
     if (root.opened) {
       root.retarget(want)
       return
     }
 
+    // Picks up a config file created since the shell started.
+    configFile.reload()
     payload.mode = want
     root.request = payload
     root.pending = true
-    capProc.command = [root.pluginDir + "/bin/zoomit-capture"].concat(want === "break" ? ["--no-shot"] : [])
+    var needsStill = want !== "break" && want !== "livedraw"
+    capProc.command = [root.pluginDir + "/bin/zoomit-capture"].concat(needsStill ? [] : ["--no-shot"])
     capProc.running = true
   }
 
   // A hotkey pressed while the overlay is up: the mode's own key leaves, the
   // draw key steps from zoom into drawing, the zoom key zooms a plain drawing.
+  // The live draw key flips between drawing and letting input through.
   function retarget(want) {
-    if (want === "draw" && root.mode === "zoom") {
+    if (root.live) {
+      if (want !== "livedraw") {
+        root.dismiss()
+        return
+      }
+      root.commitText()
+      root.current = null
+      root.mode = "draw"
+      root.helpShown = false
+      root.passthrough = !root.passthrough
+      live.requestPaint()
+      if (!root.passthrough) Qt.callLater(function() { if (root.opened) keyCatcher.forceActiveFocus() })
+    } else if (want === "draw" && root.mode === "zoom") {
       root.mode = "draw"
     } else if (want === "zoom" && (root.mode === "draw" || root.mode === "type") && root.zoom <= 1) {
       root.commitText()
@@ -129,10 +203,17 @@ Item {
     }
   }
 
+  // Called by the shell on hide, and by finish(); drops everything at once.
   function close() {
+    closeTimer.stop()
     root.opened = false
     root.pending = false
+    root.closing = false
     root.mode = ""
+    root.live = false
+    root.passthrough = false
+    root.exporting = false
+    root.helpShown = false
     root.current = null
     root.items = []
     root.redoStack = []
@@ -141,13 +222,35 @@ Item {
     root.tabHeld = false
     root.selecting = false
     root.zoom = 1
+    // Don't leave a picture of the screen behind. A snip still needs it;
+    // zoomit-export removes it once the region is cut out.
+    if (root.shotFile !== "" && !root.shotInUse)
+      Quickshell.execDetached(["rm", "-f", root.shotFile])
+    root.shotInUse = false
     root.shotFile = ""
   }
 
-  function dismiss() {
+  function finish() {
     root.close()
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide(root.pluginId)
+  }
+
+  // Leave; a zoomed view eases back to 1x first.
+  function dismiss() {
+    if (root.closing) return
+    var zoomed = root.opened && panel.visible && root.zoom > 1 && root.zoomAnimMs > 0
+      && (root.mode === "zoom" || root.mode === "draw" || root.mode === "type")
+    if (!zoomed) {
+      root.finish()
+      return
+    }
+    root.commitText()
+    root.current = null
+    root.helpShown = false
+    root.closing = true
+    root.zoom = 1
+    closeTimer.restart()
   }
 
   function captured(text) {
@@ -155,7 +258,7 @@ Item {
     var info = null
     try { info = JSON.parse(String(text || "").trim()) } catch (e) { info = null }
     if (!info || !info.screen) {
-      root.dismiss()
+      root.finish()
       return
     }
 
@@ -165,7 +268,7 @@ Item {
       if (screens[i] && screens[i].name === info.screen) target = screens[i]
     }
     if (!target) {
-      root.dismiss()
+      root.finish()
       return
     }
 
@@ -178,14 +281,15 @@ Item {
     root.zoom = 1
     root.board = ""
     root.blurPen = false
-    root.mode = root.request.mode
-    root.snipSave = root.request.save === true
+    root.live = root.request.mode === "livedraw"
+    root.mode = root.live ? "draw" : root.request.mode
+    root.snipAction = ["save", "text"].indexOf(root.request.action) !== -1 ? root.request.action : "copy"
     root.shotFile = String(info.file || "")
 
     if (root.mode === "break") {
       var minutes = Number(root.request.minutes) || root.defaultBreakMinutes
       root.breakEndMs = Date.now() + minutes * 60000
-      root.tickBreak()
+      root.breakRemaining = Math.ceil(minutes * 60)
     }
 
     root.opened = true
@@ -193,7 +297,10 @@ Item {
   }
 
   function tickBreak() {
-    root.breakRemaining = Math.ceil((root.breakEndMs - Date.now()) / 1000)
+    var remaining = Math.ceil((root.breakEndMs - Date.now()) / 1000)
+    if (remaining <= 0 && root.breakRemaining > 0 && root.breakSound !== "")
+      Quickshell.execDetached(["pw-play", root.breakSound])
+    root.breakRemaining = remaining
   }
 
   function breakText() {
@@ -349,6 +456,15 @@ Item {
 
   function exportView(action) {
     if (root.mode === "break" || root.mode === "snip") return
+    root.helpShown = false
+    if (root.live) {
+      // Nothing to grab but ink here; screenshot the monitor instead, once
+      // the pen tip has had a frame to hide.
+      root.exporting = true
+      liveExport.action = action
+      liveExport.restart()
+      return
+    }
     viewport.grabToImage(function(result) {
       var file = root.runtimeDir + "/grab-" + Date.now() + ".png"
       if (result.saveToFile(file))
@@ -367,15 +483,69 @@ Item {
     var geometry = Math.round(w * s) + "x" + Math.round(h * s)
       + "+" + Math.round(Math.min(root.selX1, root.selX2) * s)
       + "+" + Math.round(Math.min(root.selY1, root.selY2) * s)
-    Quickshell.execDetached([root.pluginDir + "/bin/zoomit-export",
-      root.snipSave ? "save" : "copy", root.shotFile, geometry])
-    root.dismiss()
+    Quickshell.execDetached([root.pluginDir + "/bin/zoomit-export", root.snipAction, root.shotFile, geometry])
+    root.shotInUse = true
+    root.finish()
+  }
+
+  function helpRows() {
+    var leave = ["Esc", "Leave"]
+    if (root.mode === "break") return [
+      ["Up / Down / wheel", "Add or remove a minute"],
+      ["R G B O Y P", "Digit colour"],
+      leave
+    ]
+    if (root.mode === "snip") return [
+      ["Drag", root.snipAction === "text" ? "Copy the text in the region"
+        : root.snipAction === "save" ? "Save the region to a file" : "Copy the region"],
+      leave
+    ]
+    if (root.mode === "type") return [
+      ["Enter", "New line"],
+      ["Up / Down / wheel", "Font size"],
+      ["Esc / click", "Finish the text"]
+    ]
+    var rows = []
+    if (root.mode === "zoom") rows.push(
+      ["Mouse", "Pan"],
+      ["Wheel / Up / Down", "Zoom level"],
+      ["Click", "Start drawing"])
+    rows.push(
+      ["Drag", "Freehand"],
+      ["Shift + drag", "Straight line"],
+      ["Ctrl + drag", "Rectangle"],
+      ["Tab + drag", "Ellipse"],
+      ["Ctrl+Shift + drag", "Arrow"],
+      ["R G B O Y P", "Pen colour"],
+      ["Shift + colour", "Highlighter"])
+    if (!root.live) rows.push(["X", "Blur pen"])
+    rows.push(
+      ["Ctrl + wheel", "Pen width"],
+      ["T / Shift+T", "Type, left or right aligned"],
+      ["Ctrl+Z / Ctrl+Y", "Undo / redo"],
+      ["E", "Erase everything"],
+      ["W / K", "White / black board"],
+      ["Ctrl+C / Ctrl+S", "Copy / save the view"])
+    if (root.live) rows.push(["Live draw key", "Let input through / resume"])
+    rows.push(root.mode === "draw" && root.zoom > 1 ? ["Right click", "Back to zoom"] : ["Right click", "Leave"])
+    rows.push(leave)
+    return rows
   }
 
   function keyPressed(event) {
     event.accepted = true
+    if (root.closing) return
     var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
     var shift = (event.modifiers & Qt.ShiftModifier) !== 0
+
+    if (event.key === Qt.Key_F1 || (root.mode !== "type" && event.text === "?")) {
+      root.helpShown = !root.helpShown
+      return
+    }
+    if (root.helpShown) {
+      root.helpShown = false
+      if (event.key === Qt.Key_Escape) return
+    }
 
     if (event.key === Qt.Key_Tab) {
       if (!event.isAutoRepeat) root.tabHeld = true
@@ -432,7 +602,8 @@ Item {
     switch (event.key) {
     case Qt.Key_Up: if (root.mode === "zoom") root.zoomBy(1); break
     case Qt.Key_Down: if (root.mode === "zoom") root.zoomBy(-1); break
-    case Qt.Key_X: root.blurPen = true; break
+    // There is no still to blur under live ink.
+    case Qt.Key_X: if (!root.live) root.blurPen = true; break
     case Qt.Key_E: root.eraseAll(); break
     case Qt.Key_W: root.board = root.board === "white" ? "" : "white"; break
     case Qt.Key_K: root.board = root.board === "black" ? "" : "black"; break
@@ -450,8 +621,10 @@ Item {
   }
 
   function pressed(mouse) {
+    if (root.closing) return
     root.mx = mouse.x
     root.my = mouse.y
+    root.helpShown = false
 
     if (mouse.button === Qt.RightButton) {
       if (root.mode === "type") {
@@ -484,6 +657,7 @@ Item {
   }
 
   function moved(mouse) {
+    if (root.closing) return
     root.mx = mouse.x
     root.my = mouse.y
     if (root.mode === "zoom") {
@@ -504,6 +678,7 @@ Item {
   }
 
   function wheeled(wheel) {
+    if (root.closing) return
     var notches = wheel.angleDelta.y / 120
     if (notches === 0) return
     if (root.mode === "zoom") {
@@ -609,6 +784,16 @@ Item {
     ctx.fillRect(caretX + item.size * 0.05, caretY, Math.max(item.size * 0.06, 1 / root.shown), item.size)
   }
 
+  FileView {
+    id: configFile
+    path: root.configPath
+    printErrors: false
+    watchChanges: true
+    onLoaded: root.loadSettings(text())
+    onLoadFailed: root.userSettings = ({})
+    onFileChanged: reload()
+  }
+
   Process {
     id: capProc
     stdout: StdioCollector {
@@ -616,7 +801,7 @@ Item {
       onStreamFinished: root.captured(text)
     }
     onExited: function(exitCode) {
-      if (exitCode !== 0 && root.pending) root.dismiss()
+      if (exitCode !== 0 && root.pending) root.finish()
     }
   }
 
@@ -627,21 +812,76 @@ Item {
     onTriggered: root.tickBreak()
   }
 
+  Timer {
+    id: closeTimer
+    interval: root.zoomAnimMs
+    onTriggered: root.finish()
+  }
+
+  Timer {
+    id: liveExport
+    property string action: "copy"
+    interval: 120
+    onTriggered: {
+      if (!root.opened || !root.targetScreen) return
+      Quickshell.execDetached([root.pluginDir + "/bin/zoomit-export", action, "screen:" + root.targetScreen.name])
+      liveExportDone.restart()
+    }
+  }
+  Timer {
+    id: liveExportDone
+    interval: 500
+    onTriggered: root.exporting = false
+  }
+
+  component BreakFace: Rectangle {
+    id: face
+    property string time: ""
+    property color ink: "#ff0000"
+    property string image: ""
+
+    Image {
+      anchors.fill: parent
+      visible: face.image !== ""
+      source: face.image !== "" ? "file://" + face.image : ""
+      fillMode: Image.PreserveAspectCrop
+      asynchronous: true
+    }
+    Text {
+      anchors.centerIn: parent
+      text: face.time
+      color: face.ink
+      font.family: "monospace"
+      font.bold: true
+      font.pixelSize: Math.round(face.height * 0.22)
+    }
+  }
+
+  Region { id: noInput }
+
   PanelWindow {
     id: panel
     screen: root.targetScreen
-    visible: root.opened && (root.mode === "break" || shot.status === Image.Ready)
+    visible: root.opened && (root.mode === "break" || root.live || shot.status === Image.Ready)
     color: "transparent"
     WlrLayershell.namespace: "tqdesign-zoomit"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    WlrLayershell.keyboardFocus: root.passthrough ? WlrKeyboardFocus.None : WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore
     anchors { top: true; bottom: true; left: true; right: true }
+    mask: root.passthrough ? noInput : null
 
     // Zoom in once the still is on screen, so the animation is seen.
     onVisibleChanged: {
       if (visible && root.mode === "zoom" && root.zoom === 1) root.zoom = root.defaultZoom
       if (visible) keyCatcher.forceActiveFocus()
+    }
+
+    // Keep Super+number and friends from changing the desktop under a still.
+    // The ZoomIt hotkeys are bound with dont_inhibit, so they still arrive.
+    ShortcutInhibitor {
+      window: panel
+      enabled: root.opened && !root.passthrough
     }
 
     // Everything a copy or save should contain.
@@ -766,26 +1006,19 @@ Item {
       }
     }
 
-    Rectangle {
-      id: breakView
+    BreakFace {
       anchors.fill: parent
       visible: root.mode === "break"
       color: root.breakBackground
-
-      Text {
-        anchors.centerIn: parent
-        text: root.breakText()
-        color: root.penColor
-        font.family: "monospace"
-        font.bold: true
-        font.pixelSize: Math.round(breakView.height * 0.22)
-      }
+      time: root.breakText()
+      ink: root.penColor
+      image: root.breakImage
     }
 
     // The pen tip, shown in place of the pointer while drawing.
     Rectangle {
       readonly property real size: Math.max(root.blurPen ? 24 : root.highlight ? Math.max(root.penWidth, 16) : root.penWidth, 4)
-      visible: root.mode === "draw"
+      visible: root.mode === "draw" && !root.passthrough && !root.exporting && !root.closing
       x: root.mx - width / 2
       y: root.my - height / 2
       width: size
@@ -818,6 +1051,52 @@ Item {
       onWheel: function(wheel) { root.wheeled(wheel) }
     }
 
+    // F1 or ? lists the keys for the current mode.
+    Rectangle {
+      visible: root.helpShown
+      anchors.centerIn: parent
+      width: helpColumn.implicitWidth + 56
+      height: helpColumn.implicitHeight + 48
+      radius: 14
+      color: Qt.rgba(0.08, 0.08, 0.1, 0.92)
+      border.width: 1
+      border.color: Qt.rgba(1, 1, 1, 0.18)
+
+      Column {
+        id: helpColumn
+        anchors.centerIn: parent
+        spacing: 7
+
+        Text {
+          text: "ZoomIt · " + (root.live ? "live draw" : root.mode)
+          color: "#ffffff"
+          font.pixelSize: 20
+          font.bold: true
+          bottomPadding: 8
+        }
+        Repeater {
+          model: root.helpShown ? root.helpRows() : []
+          Row {
+            id: helpRow
+            required property var modelData
+            spacing: 18
+            Text {
+              width: 210
+              text: helpRow.modelData[0]
+              color: "#ffd500"
+              font.family: "monospace"
+              font.pixelSize: 15
+            }
+            Text {
+              text: helpRow.modelData[1]
+              color: "#e8e8e8"
+              font.pixelSize: 15
+            }
+          }
+        }
+      }
+    }
+
     Item {
       id: keyCatcher
       anchors.fill: parent
@@ -826,6 +1105,40 @@ Item {
       Keys.onPressed: function(event) { root.keyPressed(event) }
       Keys.onReleased: function(event) {
         if (event.key === Qt.Key_Tab && !event.isAutoRepeat) root.tabHeld = false
+      }
+    }
+  }
+
+  // The break timer covers the other monitors too; the one with the pointer
+  // keeps the keyboard.
+  Variants {
+    model: Quickshell.screens
+
+    PanelWindow {
+      id: extra
+      required property var modelData
+      screen: modelData
+      visible: root.opened && root.mode === "break" && root.breakAllMonitors
+        && root.targetScreen !== null && modelData.name !== root.targetScreen.name
+      color: "transparent"
+      WlrLayershell.namespace: "tqdesign-zoomit"
+      WlrLayershell.layer: WlrLayer.Overlay
+      WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+      exclusionMode: ExclusionMode.Ignore
+      anchors { top: true; bottom: true; left: true; right: true }
+
+      BreakFace {
+        anchors.fill: parent
+        color: root.breakBackground
+        time: root.breakText()
+        ink: root.penColor
+        image: root.breakImage
+      }
+      MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.RightButton
+        cursorShape: Qt.BlankCursor
+        onPressed: root.dismiss()
       }
     }
   }

@@ -1,17 +1,22 @@
 #!/bin/bash
 # ZoomIt for Omarchy. Bind these to keys (hypr/zoomit.lua does) or run them.
 #
-#   zoomit zoom              Freeze and magnify the screen (again to leave)
-#   zoomit draw              Freeze the screen and draw on it
-#   zoomit snip [save]       Drag a region to the clipboard, or to a file
-#   zoomit break [minutes]   Full-screen countdown
-#   zoomit record [region]   Start or stop a screen recording
-#   zoomit demotype [back]   Type the next (or previous) DemoType segment
-#   zoomit demotype reset    Start the script over
+#   zoomit zoom                  Freeze and magnify the screen (again to leave)
+#   zoomit draw                  Freeze the screen and draw on it
+#   zoomit livedraw              Draw over the live screen (again to click through)
+#   zoomit snip [save|text]      Drag a region to the clipboard, a file, or as text
+#   zoomit break [minutes]       Full-screen countdown
+#   zoomit record [region]       Start or stop a screen recording
+#   zoomit demotype [back]       Type the next (or previous) DemoType segment
+#   zoomit demotype reset        Start the script over
 #
 # Live zoom is compositor zoom and lives in hypr/zoomit.lua.
+# Settings: ~/.config/zoomit/config.json (see config.example.json).
 
 set -u
+
+config="$HOME/.config/zoomit/config.json"
+runtime="${XDG_RUNTIME_DIR:-/tmp}/zoomit"
 
 summon() {
   omarchy-shell shell summon tqdesign.zoomit "$1" >/dev/null
@@ -27,21 +32,24 @@ record() {
   fi
 }
 
+submap() {
+  hyprctl eval "hl.dispatch(hl.dsp.submap(\"$1\"))" >/dev/null 2>&1
+}
+
 # DemoType: the script is ~/.config/zoomit/demotype.txt, or the clipboard when
 # that file is missing. [end] splits it into segments, one per key press.
 # Inside a segment: [pause:N] waits N seconds, [enter] [tab] [up] [down]
 # [left] [right] press that key.
-demotype() {
-  local state="${XDG_RUNTIME_DIR:-/tmp}/zoomit/demotype-index"
+#
+# With "demoTypeUserDriven": true the segment isn't typed for you: every key
+# you press types its next character instead, until the segment runs out or
+# you press Esc. hypr/zoomit.lua's zoomit-demotype submap grabs the keyboard
+# for that and calls `demotype key` per press.
+declare -a segments=() tokens=()
+declare -A tag_keys=([enter]=Return [tab]=Tab [up]=Up [down]=Down [left]=Left [right]=Right)
+
+load_segments() {
   local file="${ZOOMIT_DEMOTYPE_FILE:-$HOME/.config/zoomit/demotype.txt}"
-  local delay="${ZOOMIT_DEMOTYPE_DELAY_MS:-35}"
-  mkdir -p "$(dirname "$state")"
-
-  if [[ ${1:-} == reset ]]; then
-    rm -f "$state"
-    return
-  fi
-
   local text
   if [[ -f $file ]]; then
     text=$(<"$file")
@@ -53,7 +61,6 @@ demotype() {
     return 1
   fi
 
-  local -a segments=()
   local rest=$text
   while [[ $rest == *"[end]"* ]]; do
     local segment=${rest%%"[end]"*}
@@ -63,6 +70,116 @@ demotype() {
     rest=${rest#$'\n'}
   done
   [[ -n ${rest//[[:space:]]/} ]] && segments+=("$rest")
+  return 0
+}
+
+# Split a segment into tokens: T<text>, K<key name>, P<seconds>.
+tokenize() {
+  local segment=$1
+  tokens=()
+  while [[ $segment =~ ^([^\[]*)\[([a-z]+)(:([0-9.]+))?\](.*)$ ]]; do
+    local before=${BASH_REMATCH[1]} name=${BASH_REMATCH[2]} arg=${BASH_REMATCH[4]}
+    segment=${BASH_REMATCH[5]}
+    if [[ $name == pause && -n $arg ]]; then
+      [[ -n $before ]] && tokens+=("T$before")
+      tokens+=("P$arg")
+    elif [[ -n ${tag_keys[$name]:-} ]]; then
+      [[ -n $before ]] && tokens+=("T$before")
+      tokens+=("K${tag_keys[$name]}")
+    else
+      # Not a tag: type the bracketed text as written.
+      tokens+=("T$before[$name${arg:+:$arg}]")
+    fi
+  done
+  [[ -n $segment ]] && tokens+=("T$segment")
+}
+
+demotype_auto() {
+  local delay=$1 token
+  # The hotkey's own modifiers are still held when this starts; typing now
+  # would send Ctrl+letters.
+  sleep 0.4
+  for token in "${tokens[@]}"; do
+    case $token in
+    T*) wtype -d "$delay" -- "${token:1}" ;;
+    K*) wtype -k "${token:1}" ;;
+    P*) sleep "${token:1}" ;;
+    esac
+  done
+}
+
+# One line per key press: T<char> or K<key name>. Pauses don't apply when the
+# presenter sets the pace.
+demotype_arm() {
+  local units="$runtime/demotype-units" token text i char
+  : >"$units"
+  for token in "${tokens[@]}"; do
+    case $token in
+    K*) printf '%s\n' "$token" >>"$units" ;;
+    T*)
+      text=${token:1}
+      for ((i = 0; i < ${#text}; i++)); do
+        char=${text:i:1}
+        case $char in
+        $'\n') echo "KReturn" ;;
+        $'\t') echo "KTab" ;;
+        *) printf 'T%s\n' "$char" ;;
+        esac
+      done >>"$units"
+      ;;
+    esac
+  done
+  if [[ -s $units ]]; then
+    submap zoomit-demotype
+  else
+    rm -f "$units"
+  fi
+}
+
+demotype_key() {
+  local units="$runtime/demotype-units" unit
+  exec 9>"$runtime/demotype.lock"
+  flock 9
+  # Nothing queued means the submap outlived its segment; let go of the keys.
+  if [[ ! -s $units ]]; then
+    rm -f "$units"
+    submap reset
+    return
+  fi
+  IFS= read -r unit <"$units"
+  tail -n +2 "$units" >"$units.tmp" && mv "$units.tmp" "$units"
+  case $unit in
+  K*) wtype -k "${unit:1}" ;;
+  T*) wtype -- "${unit:1}" ;;
+  esac
+  if [[ ! -s $units ]]; then
+    rm -f "$units"
+    submap reset
+  fi
+}
+
+demotype() {
+  local state="$runtime/demotype-index"
+  mkdir -p "$runtime"
+
+  case "${1:-}" in
+  reset)
+    rm -f "$state" "$runtime/demotype-units"
+    submap reset
+    return
+    ;;
+  stop)
+    rm -f "$runtime/demotype-units"
+    submap reset
+    return
+    ;;
+  key)
+    demotype_key
+    return
+    ;;
+  esac
+
+  load_segments || return 1
 
   local index=0
   [[ -f $state ]] && index=$(<"$state")
@@ -80,40 +197,29 @@ demotype() {
   fi
   echo $((index + 1)) >"$state"
 
-  # The hotkey's own modifiers are still held when this starts; typing now
-  # would send Ctrl+letters.
-  sleep 0.4
+  tokenize "${segments[index]}"
 
-  local segment=${segments[index]}
-  local -A keys=([enter]=Return [tab]=Tab [up]=Up [down]=Down [left]=Left [right]=Right)
-  while [[ $segment =~ ^([^\[]*)\[([a-z]+)(:([0-9.]+))?\](.*)$ ]]; do
-    local before=${BASH_REMATCH[1]} name=${BASH_REMATCH[2]} arg=${BASH_REMATCH[4]}
-    local after=${BASH_REMATCH[5]}
-    if [[ $name == pause && -n $arg ]]; then
-      [[ -n $before ]] && wtype -d "$delay" -- "$before"
-      sleep "$arg"
-    elif [[ -n ${keys[$name]:-} ]]; then
-      [[ -n $before ]] && wtype -d "$delay" -- "$before"
-      wtype -k "${keys[$name]}"
-    else
-      # Not a tag: type the bracketed text as written.
-      wtype -d "$delay" -- "$before[$name${arg:+:$arg}]"
-    fi
-    segment=$after
-  done
-  [[ -n $segment ]] && wtype -d "$delay" -- "$segment"
+  local user_driven delay
+  user_driven=$(jq -r '.demoTypeUserDriven == true' "$config" 2>/dev/null)
+  delay=$(jq -r '.demoTypeDelayMs | numbers' "$config" 2>/dev/null)
+  delay=${ZOOMIT_DEMOTYPE_DELAY_MS:-${delay:-35}}
+
+  if [[ $user_driven == true ]]; then
+    demotype_arm
+  else
+    demotype_auto "$delay"
+  fi
 }
 
 case "${1:-}" in
-zoom | draw)
+zoom | draw | livedraw)
   summon "{\"mode\":\"$1\"}"
   ;;
 snip)
-  if [[ ${2:-} == save ]]; then
-    summon '{"mode":"snip","save":true}'
-  else
-    summon '{"mode":"snip"}'
-  fi
+  case "${2:-}" in
+  save | text) summon "{\"mode\":\"snip\",\"action\":\"$2\"}" ;;
+  *) summon '{"mode":"snip"}' ;;
+  esac
   ;;
 break)
   if [[ ${2:-} =~ ^[0-9]+$ ]]; then
@@ -129,7 +235,7 @@ demotype)
   demotype "${2:-}"
   ;;
 *)
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
   ;;
 esac

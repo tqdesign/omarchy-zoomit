@@ -1,0 +1,24 @@
+{
+  "defaultZoom": 2,
+  "zoomStep": 1.1,
+  "zoomAnimMs": 140,
+  "penWidth": 5,
+  "penColor": "r",
+  "fontSize": 36,
+  "arrowHeadAtStart": true,
+  "colors": {
+    "r": "#ff0000",
+    "g": "#00ff00",
+    "b": "#0000ff",
+    "o": "#ff8000",
+    "y": "#ffff00",
+    "p": "#ff00ff"
+  },
+  "breakMinutes": 10,
+  "breakBackground": "#ffffff",
+  "breakImage": "",
+  "breakSound": true,
+  "breakAllMonitors": true,
+  "demoTypeUserDriven": false,
+  "demoTypeDelayMs": 35
+}
