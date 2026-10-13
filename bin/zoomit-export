@@ -1,0 +1,37 @@
+#!/bin/bash
+# Called by Overlay.qml to finish a copy, save or snip.
+#   zoomit-export copy <image> [WxH+X+Y]
+#   zoomit-export save <image> [WxH+X+Y]
+# The optional geometry crops first (snip), in image pixels.
+
+set -u
+
+action=${1:-}
+src=${2:-}
+crop=${3:-}
+
+[[ -f $src ]] || exit 1
+
+png() {
+  if [[ -n $crop ]]; then
+    magick "$src" -crop "$crop" +repage png:-
+  else
+    magick "$src" png:-
+  fi
+}
+
+case "$action" in
+copy)
+  png | wl-copy -t image/png
+  ;;
+save)
+  out_dir="${OMARCHY_SCREENSHOT_DIR:-$(xdg-user-dir PICTURES 2>/dev/null)}"
+  out_dir="${out_dir:-$HOME/Pictures}"
+  mkdir -p "$out_dir"
+  out="$out_dir/zoomit-$(date +%Y-%m-%d_%H-%M-%S).png"
+  png >"$out" && notify-send -i "$out" "ZoomIt" "Saved ${out/#$HOME/\~}"
+  ;;
+*)
+  exit 2
+  ;;
+esac

@@ -1,0 +1,135 @@
+#!/bin/bash
+# ZoomIt for Omarchy. Bind these to keys (hypr/zoomit.lua does) or run them.
+#
+#   zoomit zoom              Freeze and magnify the screen (again to leave)
+#   zoomit draw              Freeze the screen and draw on it
+#   zoomit snip [save]       Drag a region to the clipboard, or to a file
+#   zoomit break [minutes]   Full-screen countdown
+#   zoomit record [region]   Start or stop a screen recording
+#   zoomit demotype [back]   Type the next (or previous) DemoType segment
+#   zoomit demotype reset    Start the script over
+#
+# Live zoom is compositor zoom and lives in hypr/zoomit.lua.
+
+set -u
+
+summon() {
+  omarchy-shell shell summon tqdesign.zoomit "$1" >/dev/null
+}
+
+record() {
+  if pgrep -f "^gpu-screen-recorder" >/dev/null; then
+    omarchy-capture-screenrecording --stop-recording
+  elif [[ ${1:-} == region ]]; then
+    omarchy-capture-screenrecording
+  else
+    omarchy-capture-screenrecording --fullscreen
+  fi
+}
+
+# DemoType: the script is ~/.config/zoomit/demotype.txt, or the clipboard when
+# that file is missing. [end] splits it into segments, one per key press.
+# Inside a segment: [pause:N] waits N seconds, [enter] [tab] [up] [down]
+# [left] [right] press that key.
+demotype() {
+  local state="${XDG_RUNTIME_DIR:-/tmp}/zoomit/demotype-index"
+  local file="${ZOOMIT_DEMOTYPE_FILE:-$HOME/.config/zoomit/demotype.txt}"
+  local delay="${ZOOMIT_DEMOTYPE_DELAY_MS:-35}"
+  mkdir -p "$(dirname "$state")"
+
+  if [[ ${1:-} == reset ]]; then
+    rm -f "$state"
+    return
+  fi
+
+  local text
+  if [[ -f $file ]]; then
+    text=$(<"$file")
+  else
+    text=$(wl-paste --no-newline --type text 2>/dev/null)
+  fi
+  if [[ -z $text ]]; then
+    notify-send "ZoomIt" "DemoType has nothing to type. Add ${file/#$HOME/\~} or copy some text."
+    return 1
+  fi
+
+  local -a segments=()
+  local rest=$text
+  while [[ $rest == *"[end]"* ]]; do
+    local segment=${rest%%"[end]"*}
+    # [end] on its own line shouldn't type that line break.
+    segments+=("${segment%$'\n'}")
+    rest=${rest#*"[end]"}
+    rest=${rest#$'\n'}
+  done
+  [[ -n ${rest//[[:space:]]/} ]] && segments+=("$rest")
+
+  local index=0
+  [[ -f $state ]] && index=$(<"$state")
+  [[ $index =~ ^[0-9]+$ ]] || index=0
+
+  if [[ ${1:-} == back ]]; then
+    ((index > 0)) && echo $((index - 1)) >"$state"
+    return
+  fi
+
+  if ((index >= ${#segments[@]})); then
+    notify-send "ZoomIt" "DemoType reached the end of the script."
+    rm -f "$state"
+    return
+  fi
+  echo $((index + 1)) >"$state"
+
+  # The hotkey's own modifiers are still held when this starts; typing now
+  # would send Ctrl+letters.
+  sleep 0.4
+
+  local segment=${segments[index]}
+  local -A keys=([enter]=Return [tab]=Tab [up]=Up [down]=Down [left]=Left [right]=Right)
+  while [[ $segment =~ ^([^\[]*)\[([a-z]+)(:([0-9.]+))?\](.*)$ ]]; do
+    local before=${BASH_REMATCH[1]} name=${BASH_REMATCH[2]} arg=${BASH_REMATCH[4]}
+    local after=${BASH_REMATCH[5]}
+    if [[ $name == pause && -n $arg ]]; then
+      [[ -n $before ]] && wtype -d "$delay" -- "$before"
+      sleep "$arg"
+    elif [[ -n ${keys[$name]:-} ]]; then
+      [[ -n $before ]] && wtype -d "$delay" -- "$before"
+      wtype -k "${keys[$name]}"
+    else
+      # Not a tag: type the bracketed text as written.
+      wtype -d "$delay" -- "$before[$name${arg:+:$arg}]"
+    fi
+    segment=$after
+  done
+  [[ -n $segment ]] && wtype -d "$delay" -- "$segment"
+}
+
+case "${1:-}" in
+zoom | draw)
+  summon "{\"mode\":\"$1\"}"
+  ;;
+snip)
+  if [[ ${2:-} == save ]]; then
+    summon '{"mode":"snip","save":true}'
+  else
+    summon '{"mode":"snip"}'
+  fi
+  ;;
+break)
+  if [[ ${2:-} =~ ^[0-9]+$ ]]; then
+    summon "{\"mode\":\"break\",\"minutes\":$2}"
+  else
+    summon '{"mode":"break"}'
+  fi
+  ;;
+record)
+  record "${2:-}"
+  ;;
+demotype)
+  demotype "${2:-}"
+  ;;
+*)
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 2
+  ;;
+esac

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "tqdesign.zoomit",
+  "name": "ZoomIt",
+  "version": "1.0.0",
+  "author": "tqdesign",
+  "license": "MIT",
+  "description": "Screen zoom, annotation, break timer and snip for presentations, modelled on Sysinternals ZoomIt. Summon with {\"mode\":\"zoom|draw|snip|break\"}.",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Overlay.qml"
+  }
+}

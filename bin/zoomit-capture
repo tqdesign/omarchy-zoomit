@@ -1,0 +1,36 @@
+#!/bin/bash
+# Called by Overlay.qml before it shows. Finds the monitor under the pointer,
+# freezes it to a file (unless --no-shot) and prints one JSON line:
+#   {"screen":"eDP-2","x":640,"y":400,"file":"/run/user/1000/zoomit/shot-1.ppm"}
+# x/y are the pointer in that monitor's logical coordinates. Layer surfaces
+# can't read the global pointer themselves.
+
+set -u
+
+dir="${XDG_RUNTIME_DIR:-/tmp}/zoomit"
+mkdir -p "$dir"
+
+read -r cx cy < <(hyprctl cursorpos | tr -d ',')
+cx=${cx:-0}
+cy=${cy:-0}
+
+mon=$(hyprctl monitors -j | jq -c --argjson x "$cx" --argjson y "$cy" '
+  map(select(.disabled | not)
+      | (if (.transform % 2) == 1 then {w: .height, h: .width} else {w: .width, h: .height} end) as $px
+      | . + {lw: ($px.w / .scale), lh: ($px.h / .scale)})
+  | (map(select($x >= .x and $x < .x + .lw and $y >= .y and $y < .y + .lh))[0]
+     // map(select(.focused))[0]
+     // .[0])
+  | {screen: .name, x: ($x - .x), y: ($y - .y)}')
+
+[[ -n $mon && $mon != null ]] || exit 1
+
+file=""
+if [[ ${1:-} != --no-shot ]]; then
+  rm -f "$dir"/shot-*.ppm
+  file="$dir/shot-$$.ppm"
+  # ppm skips PNG encoding: ~50ms for a 2560x1600 output.
+  grim -o "$(jq -r .screen <<<"$mon")" -t ppm "$file" || exit 1
+fi
+
+jq -c --arg file "$file" '. + {file: $file}' <<<"$mon"
